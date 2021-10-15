@@ -22,22 +22,35 @@ type operation struct {
 	spanKind    string
 }
 
+func (o operation) len() uint64 {
+	return uint64(len(o.serviceName) + len(o.spanName) + len(o.spanKind))
+}
+
 //Operation batch queues up items to send to the db but it sorts before sending
 //this avoids deadlocks in the db
-type operationBatch map[operation]pgtype.Int8
+type operationBatch struct {
+	batch map[operation]pgtype.Int8
+	cache OperationCache
+}
 
-func newOperationBatch() operationBatch {
-	return make(map[operation]pgtype.Int8)
+func newOperationBatch(cache OperationCache) operationBatch {
+	return operationBatch{
+		cache: cache,
+		batch: make(map[operation]pgtype.Int8),
+	}
 }
 
 func (o operationBatch) Queue(serviceName, spanName, spanKind string) {
-	o[operation{serviceName, spanName, spanKind}] = pgtype.Int8{}
+	op := operation{serviceName, spanName, spanKind}
+	if !o.cache.Exists(op) {
+		o.batch[op] = pgtype.Int8{}
+	}
 }
 
-func (batch operationBatch) SendBatch(ctx context.Context, conn pgxconn.PgxConn) error {
-	ops := make([]operation, len(batch))
+func (o operationBatch) SendBatch(ctx context.Context, conn pgxconn.PgxConn) (err error) {
+	ops := make([]operation, len(o.batch))
 	i := 0
-	for op := range batch {
+	for op := range o.batch {
 		ops[i] = op
 		i++
 	}
@@ -59,22 +72,25 @@ func (batch operationBatch) SendBatch(ctx context.Context, conn pgxconn.PgxConn)
 	if err != nil {
 		return err
 	}
+	defer func() {
+		// Only return Close error if there was no previous error.
+		if tempErr := br.Close(); err == nil {
+			err = tempErr
+		}
+	}()
+	var id pgtype.Int8
 	for _, op := range ops {
-		var id pgtype.Int8
 		if err := br.QueryRow().Scan(&id); err != nil {
 			return err
 		}
-		batch[op] = id
-	}
-	if err = br.Close(); err != nil {
-		return err
+		o.cache.Set(op, id)
 	}
 	return nil
 }
-func (batch operationBatch) GetID(serviceName, spanName, spanKind string) (pgtype.Int8, error) {
-	id, ok := batch[operation{serviceName, spanName, spanKind}]
-	if !ok {
-		return pgtype.Int8{Status: pgtype.Null}, fmt.Errorf("operation id not found: %s %s %s", serviceName, spanName, spanKind)
+func (o operationBatch) GetID(serviceName, spanName, spanKind string) (pgtype.Int8, error) {
+	id, err := o.cache.Get(operation{serviceName, spanName, spanKind})
+	if err != nil {
+		return pgtype.Int8{Status: pgtype.Null}, fmt.Errorf("error getting operation from cache: %w", err)
 	}
 	if id.Status != pgtype.Present {
 		return pgtype.Int8{Status: pgtype.Null}, fmt.Errorf("operation id is null")

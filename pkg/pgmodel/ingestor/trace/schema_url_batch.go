@@ -18,24 +18,38 @@ const insertSchemaURLSQL = `SELECT %s.put_schema_url($1)`
 
 type schemaURL string
 
-//schemaURLBatch queues up items to send to the DB but it sorts before sending
-//this avoids deadlocks in the DB. It also avoids sending the same URLs repeatedly.
-type schemaURLBatch map[schemaURL]pgtype.Int8
-
-func newSchemaUrlBatch() schemaURLBatch {
-	return make(map[schemaURL]pgtype.Int8)
+func (s schemaURL) len() uint64 {
+	return uint64(len(s))
 }
 
-func (batch schemaURLBatch) Queue(url string) {
-	if url != "" {
-		batch[schemaURL(url)] = pgtype.Int8{}
+//schemaURLBatch queues up items to send to the DB but it sorts before sending
+//this avoids deadlocks in the DB. It also avoids sending the same URLs repeatedly.
+type schemaURLBatch struct {
+	batch map[schemaURL]pgtype.Int8
+	cache SchemaURLCache
+}
+
+func newSchemaUrlBatch(cache SchemaURLCache) schemaURLBatch {
+	return schemaURLBatch{
+		cache: cache,
+		batch: make(map[schemaURL]pgtype.Int8),
 	}
 }
 
-func (batch schemaURLBatch) SendBatch(ctx context.Context, conn pgxconn.PgxConn) error {
-	urls := make([]schemaURL, len(batch))
+func (s schemaURLBatch) Queue(url string) {
+	if url == "" {
+		return
+	}
+	u := schemaURL(url)
+	if !s.cache.Exists(u) {
+		s.batch[u] = pgtype.Int8{}
+	}
+}
+
+func (s schemaURLBatch) SendBatch(ctx context.Context, conn pgxconn.PgxConn) (err error) {
+	urls := make([]schemaURL, len(s.batch))
 	i := 0
-	for url := range batch {
+	for url := range s.batch {
 		urls[i] = url
 		i++
 	}
@@ -52,32 +66,38 @@ func (batch schemaURLBatch) SendBatch(ctx context.Context, conn pgxconn.PgxConn)
 	if err != nil {
 		return err
 	}
-	for _, sURL := range urls {
-		var id pgtype.Int8
+
+	defer func() {
+		// Only return Close error if there was no previous error.
+		if tempErr := br.Close(); err == nil {
+			err = tempErr
+		}
+	}()
+
+	var id pgtype.Int8
+	for _, url := range urls {
 		if err := br.QueryRow().Scan(&id); err != nil {
 			return err
 		}
-		batch[sURL] = id
+		s.cache.Set(url, id)
 	}
-	if err = br.Close(); err != nil {
-		return err
-	}
+
 	return nil
 }
 
-func (batch schemaURLBatch) GetID(url string) (pgtype.Int8, error) {
+func (s schemaURLBatch) GetID(url string) (pgtype.Int8, error) {
 	if url == "" {
 		return pgtype.Int8{Status: pgtype.Null}, nil
 	}
-	id, ok := batch[schemaURL(url)]
-	if !ok {
-		return pgtype.Int8{Status: pgtype.Null}, fmt.Errorf("schema url id not found")
+	id, err := s.cache.Get(schemaURL(url))
+	if err != nil {
+		return pgtype.Int8{Status: pgtype.Null}, fmt.Errorf("error getting schema URL ID from cache: %w", err)
 	}
 	if id.Status != pgtype.Present {
-		return pgtype.Int8{Status: pgtype.Null}, fmt.Errorf("schema url id is null")
+		return pgtype.Int8{Status: pgtype.Null}, fmt.Errorf("schema URL ID is null for URL: %s", url)
 	}
 	if id.Int == 0 {
-		return pgtype.Int8{Status: pgtype.Null}, fmt.Errorf("schema url id is 0")
+		return pgtype.Int8{Status: pgtype.Null}, fmt.Errorf("schema URL ID is 0 for URL: %s", url)
 	}
 	return id, nil
 }

@@ -26,34 +26,48 @@ type tag struct {
 	typ   TagType
 }
 
+func (t tag) len() uint64 {
+	return uint64(len(t.key) + len(t.value) + 8) // 8 bytes for the TagType field.
+}
+
 type tagIDs struct {
 	keyID   pgtype.Int8
 	valueID pgtype.Int8
 }
 
-//tagBatch queues up items to send to the db but it sorts before sending
-//this avoids deadlocks in the db. It also avoids sending the same tags repeatedly.
-type tagBatch map[tag]tagIDs
-
-func newTagBatch() tagBatch {
-	return make(map[tag]tagIDs)
+func (t tagIDs) len() uint64 {
+	return 18 // 9 bytes per pgtype.Int8.
 }
 
-func (batch tagBatch) Queue(tags map[string]interface{}, typ TagType) error {
+//tagBatch queues up items to send to the db but it sorts before sending
+//this avoids deadlocks in the db. It also avoids sending the same tags repeatedly.
+type tagBatch struct {
+	batch map[tag]tagIDs
+	cache TagCache
+}
+
+func newTagBatch(cache TagCache) tagBatch {
+	return tagBatch{
+		batch: make(map[tag]tagIDs),
+		cache: cache,
+	}
+}
+
+func (t tagBatch) Queue(tags map[string]interface{}, typ TagType) error {
 	for k, v := range tags {
 		byteVal, err := json.Marshal(v)
 		if err != nil {
 			return err
 		}
-		batch[tag{k, string(byteVal), typ}] = tagIDs{}
+		t.batch[tag{k, string(byteVal), typ}] = tagIDs{}
 	}
 	return nil
 }
 
-func (batch tagBatch) SendBatch(ctx context.Context, conn pgxconn.PgxConn) error {
-	tags := make([]tag, len(batch))
+func (t tagBatch) SendBatch(ctx context.Context, conn pgxconn.PgxConn) (err error) {
+	tags := make([]tag, len(t.batch))
 	i := 0
-	for op := range batch {
+	for op := range t.batch {
 		tags[i] = op
 		i++
 	}
@@ -82,6 +96,12 @@ func (batch tagBatch) SendBatch(ctx context.Context, conn pgxconn.PgxConn) error
 	if err != nil {
 		return err
 	}
+	defer func() {
+		// Only return Close error if there was no previous error.
+		if tempErr := br.Close(); err == nil {
+			err = tempErr
+		}
+	}()
 	for _, tag := range tags {
 		var keyID, valueID pgtype.Int8
 		if err := br.QueryRow().Scan(&keyID); err != nil {
@@ -90,25 +110,21 @@ func (batch tagBatch) SendBatch(ctx context.Context, conn pgxconn.PgxConn) error
 		if err := br.QueryRow().Scan(&valueID); err != nil {
 			return err
 		}
-		batch[tag] = tagIDs{keyID: keyID, valueID: valueID}
-	}
-	if err = br.Close(); err != nil {
-		return err
+		t.cache.Set(tag, tagIDs{keyID: keyID, valueID: valueID})
 	}
 	return nil
 }
 
-func (batch tagBatch) GetTagMapJSON(tags map[string]interface{}, typ TagType) ([]byte, error) {
+func (t tagBatch) GetTagMapJSON(tags map[string]interface{}, typ TagType) ([]byte, error) {
 	tagMap := make(map[int64]int64)
 	for k, v := range tags {
 		byteVal, err := json.Marshal(v)
 		if err != nil {
 			return nil, err
 		}
-		ids, ok := batch[tag{k, string(byteVal), typ}]
-		if !ok {
-			return nil, fmt.Errorf("tag id not found: %s %v(rendered as %s) %v", k, v, string(byteVal), typ)
-
+		ids, err := t.cache.Get(tag{k, string(byteVal), typ})
+		if err != nil {
+			return nil, fmt.Errorf("error getting tag IDs from cache: %w", err)
 		}
 		if ids.keyID.Status != pgtype.Present || ids.valueID.Status != pgtype.Present {
 			return nil, fmt.Errorf("tag ids have NULL values: %#v", ids)

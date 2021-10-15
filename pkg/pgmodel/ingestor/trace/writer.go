@@ -46,11 +46,20 @@ type Writer interface {
 
 type traceWriterImpl struct {
 	conn pgxconn.PgxConn
+
+	schemaCache  SchemaURLCache
+	instLibCache InstrumentationLibraryCache
+	opCache      OperationCache
+	tagCache     TagCache
 }
 
 func NewWriter(conn pgxconn.PgxConn) *traceWriterImpl {
 	return &traceWriterImpl{
-		conn: conn,
+		conn:         conn,
+		schemaCache:  newSchemaCache(),
+		instLibCache: newInstrumentationLibraryCache(),
+		opCache:      newOperationCache(),
+		tagCache:     newTagCache(),
 	}
 }
 
@@ -114,7 +123,7 @@ func getServiceName(rSpan pdata.ResourceSpans) string {
 func (t *traceWriterImpl) InsertTraces(ctx context.Context, traces pdata.Traces) error {
 	rSpans := traces.ResourceSpans()
 
-	sURLBatch := newSchemaUrlBatch()
+	sURLBatch := newSchemaUrlBatch(t.schemaCache)
 	for i := 0; i < rSpans.Len(); i++ {
 		rSpan := rSpans.At(i)
 		url := rSpan.SchemaUrl()
@@ -131,9 +140,9 @@ func (t *traceWriterImpl) InsertTraces(ctx context.Context, traces pdata.Traces)
 		return err
 	}
 
-	instrLibBatch := newInstrumentationLibraryBatch()
-	operationBatch := newOperationBatch()
-	tagsBatch := newTagBatch()
+	instrLibBatch := newInstrumentationLibraryBatch(t.instLibCache)
+	operationBatch := newOperationBatch(t.opCache)
+	tagsBatch := newTagBatch(t.tagCache)
 	for i := 0; i < rSpans.Len(); i++ {
 		rSpan := rSpans.At(i)
 		serviceName := getServiceName(rSpan)
